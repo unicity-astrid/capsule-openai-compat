@@ -16,10 +16,10 @@ capabilities = { net = ["*"] }
 
 [publish]
 "llm.v1.stream.openai-compat" = { wit = "@unicity-astrid/wit/llm/stream-event" }
-"llm.v1.response.describe.*" = { wit = "TODO" }              # no canonical type yet — provider-describe response not enumerated in the llm interface
+"llm.v1.response.describe.*" = { wit = "@unicity-astrid/wit/llm/describe-response" }
 
 [subscribe]
-"llm.v1.request.describe" = { wit = "TODO", handler = "llm_describe" }   # no canonical type yet — provider-describe request not enumerated in the llm interface
+"llm.v1.request.describe" = { wit = "@unicity-astrid/wit/llm/describe-request", handler = "llm_describe" }
 "llm.v1.request.generate.openai-compat" = { wit = "@unicity-astrid/wit/llm/generate-request", handler = "handle_llm_request" }
 
 [capabilities]
