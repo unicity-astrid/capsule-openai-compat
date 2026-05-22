@@ -64,10 +64,18 @@ impl OpenAICompatProvider {
 
     /// Returns provider metadata for IPC-based provider discovery.
     ///
-    /// Called by the registry capsule via the `llm.v1.request.describe` IPC
-    /// topic (the `#[astrid::interceptor]` wires this into the per-domain
-    /// `astrid-hook-trigger` guest export). Returns the provider's model ID,
-    /// capabilities, and IPC routing topics.
+    /// The registry capsule publishes a `llm.v1.request.describe` envelope
+    /// and drains responses on `llm.v1.response.describe` for a bounded
+    /// window. Each provider capsule subscribes to the request topic and
+    /// publishes its capability descriptor on the response topic. This
+    /// replaces the pre-#752 `hooks::trigger` fan-out path that returned
+    /// interceptor results through kernel-mediated dispatch — under the
+    /// new ABI the interceptor return value is no longer fanned out, so
+    /// the provider must publish explicitly.
+    ///
+    /// The return value is kept (same shape) so other interceptor callers
+    /// continue to see the descriptor; the explicit `ipc::publish_json`
+    /// is what registry's new fan-out actually consumes.
     #[astrid::interceptor("llm_describe")]
     pub fn llm_describe(&self, _payload: serde_json::Value) -> Result<serde_json::Value, SysError> {
         let model = env::var("model").unwrap_or_else(|_| "unknown".into());
@@ -79,7 +87,7 @@ impl OpenAICompatProvider {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8_192);
-        Ok(serde_json::json!({
+        let response = serde_json::json!({
             "providers": [{
                 "id": "openai-compat",
                 "description": format!("OpenAI-compatible provider (default model: {model})"),
@@ -89,7 +97,9 @@ impl OpenAICompatProvider {
                 "context_window": context_window,
                 "max_output_tokens": max_output,
             }]
-        }))
+        });
+        ipc::publish_json("llm.v1.response.describe", &response)?;
+        Ok(response)
     }
 }
 
