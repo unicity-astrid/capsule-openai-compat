@@ -22,7 +22,7 @@ mod schemas;
 
 use astrid_sdk::prelude::*;
 use astrid_sdk::types::{IpcPayload, Message, MessageContent, MessageRole, StreamEvent};
-use schemas::ChatCompletionChunk;
+use schemas::{ChatCompletionChunk, ModelList};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -78,7 +78,7 @@ impl OpenAICompatProvider {
     /// is what registry's new fan-out actually consumes.
     #[astrid::interceptor("llm_describe")]
     pub fn llm_describe(&self, _payload: serde_json::Value) -> Result<serde_json::Value, SysError> {
-        let model = env::var("model").unwrap_or_else(|_| "unknown".into());
+        let default_model = env::var("model").unwrap_or_else(|_| "unknown".into());
         let context_window = env::var("context_window")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -87,23 +87,116 @@ impl OpenAICompatProvider {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8_192);
-        let response = serde_json::json!({
-            "providers": [{
-                "id": "openai-compat",
-                "description": format!("OpenAI-compatible provider (default model: {model})"),
-                "capabilities": ["text", "vision", "tools"],
-                "request_topic": "llm.v1.request.generate.openai-compat",
-                "stream_topic": "llm.v1.stream.openai-compat",
-                "context_window": context_window,
-                "max_output_tokens": max_output,
-            }]
-        });
+
+        // Discover the upstream catalogue; on any failure fall back to the single
+        // env-configured default model so existing installs never regress.
+        let model_ids = match Self::discover_models() {
+            Ok(ids) => ids,
+            Err(e) => {
+                log::warn(format!(
+                    "/v1/models discovery failed, using env default: {e}"
+                ));
+                vec![default_model.clone()]
+            }
+        };
+
+        let providers =
+            Self::describe_providers(&model_ids, &default_model, context_window, max_output);
+        let response = serde_json::json!({ "providers": providers });
         ipc::publish_json("llm.v1.response.describe", &response)?;
         Ok(response)
     }
 }
 
 impl OpenAICompatProvider {
+    /// Query `GET {base_url}/v1/models` and return the discovered model ids.
+    ///
+    /// Returns `Ok(Vec)` with **at least one** id on success. Any failure
+    /// (network error, non-2xx, unparseable body, empty `data`, server that
+    /// does not implement `/v1/models`) returns `Err` so the caller falls back
+    /// to the env default. Never panics; never blocks beyond the host HTTP
+    /// timeout.
+    fn discover_models() -> Result<Vec<String>, SysError> {
+        let base_url = env::var("base_url").unwrap_or_else(|_| "https://api.openai.com".into());
+        let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+
+        let mut req = http::Request::get(&url);
+        let api_key = env::var("api_key").unwrap_or_default();
+        if !api_key.is_empty() {
+            req = req.header("authorization", format!("Bearer {api_key}"));
+        }
+
+        let resp = http::send(&req)?;
+        if !resp.is_success() {
+            return Err(SysError::ApiError(format!(
+                "/v1/models returned status {}",
+                resp.status()
+            )));
+        }
+
+        let list: ModelList = resp.json()?;
+        Self::extract_model_ids(list)
+    }
+
+    /// Pure extraction + emptiness gate, split out so it is unit-testable
+    /// without HTTP. Drops empty ids; errors if nothing usable remains so the
+    /// caller falls back to the env default.
+    fn extract_model_ids(list: ModelList) -> Result<Vec<String>, SysError> {
+        let ids: Vec<String> = list
+            .data
+            .into_iter()
+            .map(|m| m.id)
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Err(SysError::ApiError("/v1/models returned no models".into()));
+        }
+        Ok(ids)
+    }
+
+    /// Build one provider-entry per model id, with the env-default model emitted
+    /// FIRST (`entry[0]`) so the registry can pre-select it positionally. Every
+    /// entry shares the same `request_topic`/`stream_topic`. There is NO
+    /// `"default"` field — the default is signalled by ORDER. All entries are
+    /// plain `serde_json::Value`.
+    ///
+    /// Ordering rules:
+    /// - If `default_model` appears in `model_ids`, its entry is `entry[0]` and
+    ///   the remaining ids keep their discovered order after it.
+    /// - If `default_model` is NOT in `model_ids` (the upstream catalogue does
+    ///   not advertise the configured default), the discovered order is
+    ///   preserved unchanged; `entry[0]` is simply the first discovered model.
+    ///   The registry still auto-selects `entry[0]`; the operator's configured
+    ///   `model` was not offered by the upstream, so the first servable model is
+    ///   the best default.
+    fn describe_providers(
+        model_ids: &[String],
+        default_model: &str,
+        context_window: u64,
+        max_output: u64,
+    ) -> Vec<serde_json::Value> {
+        // Stable partition: default model first (if present), then the rest in
+        // their discovered order.
+        let mut ordered: Vec<&String> = Vec::with_capacity(model_ids.len());
+        ordered.extend(model_ids.iter().filter(|id| id.as_str() == default_model));
+        ordered.extend(model_ids.iter().filter(|id| id.as_str() != default_model));
+
+        ordered
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "description": format!("OpenAI-compatible model: {id}"),
+                    "capabilities": ["text", "vision", "tools"],
+                    "request_topic": "llm.v1.request.generate.openai-compat",
+                    "stream_topic": "llm.v1.stream.openai-compat",
+                    "context_window": context_window,
+                    "max_output_tokens": max_output,
+                })
+            })
+            .collect()
+    }
+
     /// Build and send the HTTP request, then parse the SSE response.
     fn execute_request(
         request_id: Uuid,
@@ -424,5 +517,128 @@ impl OpenAICompatProvider {
             MessageRole::Assistant => "assistant",
             MessageRole::Tool => "tool",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelList, OpenAICompatProvider};
+
+    const REQUEST_TOPIC: &str = "llm.v1.request.generate.openai-compat";
+
+    /// Helper: collect the `id` field of every provider entry, in order.
+    fn ids(entries: &[serde_json::Value]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn parse_models_body_yields_one_entry_per_id() {
+        // Representative `/v1/models` body with vendor-specific extra fields and
+        // an ollama-style colon id alongside a real OpenAI-style id.
+        let body = r#"{
+            "object": "list",
+            "data": [
+                { "id": "gpt-5.4", "object": "model", "owned_by": "openai" },
+                { "id": "llama3.3:70b", "object": "model", "owned_by": "library" },
+                { "id": "mixtral-8x7b", "object": "model", "created": 1700000000 }
+            ]
+        }"#;
+        let list: ModelList = serde_json::from_str(body).expect("parse model list");
+        assert_eq!(list.data.len(), 3);
+        // The colon in the ollama-style id survives deserialization verbatim.
+        assert_eq!(list.data[1].id, "llama3.3:70b");
+
+        let model_ids = OpenAICompatProvider::extract_model_ids(list).expect("non-empty");
+        assert_eq!(model_ids, vec!["gpt-5.4", "llama3.3:70b", "mixtral-8x7b"]);
+
+        let entries =
+            OpenAICompatProvider::describe_providers(&model_ids, "gpt-5.4", 128_000, 8_192);
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert_eq!(entry["request_topic"].as_str().unwrap(), REQUEST_TOPIC);
+        }
+        // `id` equals the source model id end-to-end (colon preserved).
+        assert_eq!(
+            ids(&entries),
+            vec!["gpt-5.4", "llama3.3:70b", "mixtral-8x7b"]
+        );
+    }
+
+    #[test]
+    fn describe_emits_env_model_first() {
+        // Default model is present but NOT first in discovered order.
+        let model_ids = vec![
+            "first-discovered".to_string(),
+            "the-default".to_string(),
+            "last-discovered".to_string(),
+        ];
+        let entries =
+            OpenAICompatProvider::describe_providers(&model_ids, "the-default", 128_000, 8_192);
+
+        // entry[0] is the env default; the rest keep their discovered order.
+        assert_eq!(entries[0]["id"].as_str().unwrap(), "the-default");
+        assert_eq!(
+            ids(&entries),
+            vec!["the-default", "first-discovered", "last-discovered"]
+        );
+
+        // No entry carries a "default" key — ordering is the only signal.
+        for entry in &entries {
+            assert!(entry.get("default").is_none());
+        }
+    }
+
+    #[test]
+    fn describe_preserves_order_when_default_absent() {
+        // Default model is NOT in the discovered list.
+        let model_ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let entries =
+            OpenAICompatProvider::describe_providers(&model_ids, "not-present", 128_000, 8_192);
+
+        // Discovered order preserved unchanged; nothing dropped.
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["id"].as_str().unwrap(), "alpha");
+        assert_eq!(ids(&entries), vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn empty_data_is_discovery_error() {
+        // Empty `data` array funnels to the fallback Err arm.
+        let empty: ModelList = serde_json::from_str(r#"{ "data": [] }"#).expect("parse");
+        assert!(OpenAICompatProvider::extract_model_ids(empty).is_err());
+
+        // A sole entry with an empty `id` is dropped, leaving nothing usable.
+        let blank: ModelList =
+            serde_json::from_str(r#"{ "data": [ { "id": "" } ] }"#).expect("parse");
+        assert!(OpenAICompatProvider::extract_model_ids(blank).is_err());
+    }
+
+    #[test]
+    fn unparseable_body_is_discovery_error() {
+        // A non-JSON / HTML body (e.g. a 404 page) fails to deserialize, which
+        // is the Err that triggers the env fallback in `discover_models`.
+        let result: Result<ModelList, _> = serde_json::from_str("<html>404</html>");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fallback_advertisement_matches_single_model_shape() {
+        // The discovery-failure path advertises a single env-model entry.
+        let entries = OpenAICompatProvider::describe_providers(
+            &["gpt-5.4".to_string()],
+            "gpt-5.4",
+            128_000,
+            8_192,
+        );
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["id"].as_str().unwrap(), "gpt-5.4");
+        assert_eq!(entry["request_topic"].as_str().unwrap(), REQUEST_TOPIC);
+        // Shape-stable, positionally-default, no "default" key.
+        assert!(entry.get("default").is_none());
     }
 }
