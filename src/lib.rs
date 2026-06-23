@@ -78,7 +78,10 @@ impl OpenAICompatProvider {
     /// is what registry's new fan-out actually consumes.
     #[astrid::interceptor("llm_describe")]
     pub fn llm_describe(&self, _payload: serde_json::Value) -> Result<serde_json::Value, SysError> {
-        let default_model = env::var("model").unwrap_or_else(|_| "unknown".into());
+        // A blank or whitespace-only env `model` is treated as unset: we never
+        // advertise a bogus `unknown` id the registry could bind and then send
+        // upstream verbatim. The configured default is `None` in that case.
+        let default_model = Self::parse_env_model(env::var("model").ok());
         let context_window = env::var("context_window")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -88,20 +91,25 @@ impl OpenAICompatProvider {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8_192);
 
-        // Discover the upstream catalogue; on any failure fall back to the single
-        // env-configured default model so existing installs never regress.
-        let model_ids = match Self::discover_models() {
-            Ok(ids) => ids,
-            Err(e) => {
-                log::warn(format!(
+        // Discover the upstream catalogue, folding the discovery result and the
+        // configured default into the final id list (see `resolve_model_ids`).
+        let discovery = Self::discover_models();
+        if let Err(e) = &discovery {
+            match &default_model {
+                Some(_) => log::warn(format!(
                     "/v1/models discovery failed, using env default: {e}"
-                ));
-                vec![default_model.clone()]
+                )),
+                None => log::warn(format!(
+                    "/v1/models discovery failed and no env model configured; \
+                     advertising no provider entries: {e}"
+                )),
             }
-        };
+        }
+        let model_ids = Self::resolve_model_ids(discovery, default_model.as_deref());
 
+        let default_ref = default_model.as_deref().unwrap_or("");
         let providers =
-            Self::describe_providers(&model_ids, &default_model, context_window, max_output);
+            Self::describe_providers(&model_ids, default_ref, context_window, max_output);
         let response = serde_json::json!({ "providers": providers });
         ipc::publish_json("llm.v1.response.describe", &response)?;
         Ok(response)
@@ -109,6 +117,38 @@ impl OpenAICompatProvider {
 }
 
 impl OpenAICompatProvider {
+    /// Normalize the raw env `model` value into a configured default.
+    ///
+    /// A missing value, or one that is empty or whitespace-only after trimming,
+    /// is treated as **unset** (`None`). This is deliberate: a blank env model
+    /// must never become a selectable provider-entry id, otherwise the registry
+    /// could bind it and we would send a meaningless `model` upstream.
+    fn parse_env_model(raw: Option<String>) -> Option<String> {
+        raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    }
+
+    /// Fold the `/v1/models` discovery result and the configured default into
+    /// the final list of model ids to advertise.
+    ///
+    /// - Discovery succeeded: use the discovered ids verbatim.
+    /// - Discovery failed but a default is configured: fall back to that single
+    ///   id so existing pinned installs never regress.
+    /// - Discovery failed AND no default is configured: return an empty list, so
+    ///   the provider advertises NO entries rather than a bogus `unknown` one
+    ///   that the registry could bind and then send upstream.
+    fn resolve_model_ids(
+        discovery: Result<Vec<String>, SysError>,
+        default_model: Option<&str>,
+    ) -> Vec<String> {
+        match discovery {
+            Ok(ids) => ids,
+            Err(_) => match default_model {
+                Some(model) => vec![model.to_string()],
+                None => Vec::new(),
+            },
+        }
+    }
+
     /// Query `GET {base_url}/v1/models` and return the discovered model ids.
     ///
     /// Returns `Ok(Vec)` with **at least one** id on success. Any failure
@@ -193,7 +233,7 @@ impl OpenAICompatProvider {
                     "description": format!("OpenAI-compatible model: {id}"),
                     "capabilities": ["text", "vision", "tools"],
                     "request_topic": "llm.v1.request.generate.openai-compat",
-                    "stream_topic": "llm.v1.stream.openai-compat",
+                    "stream_topic": STREAM_TOPIC,
                     "context_window": context_window,
                     "max_output_tokens": max_output,
                 })
@@ -653,6 +693,70 @@ mod tests {
         // is the Err that triggers the env fallback in `discover_models`.
         let result: Result<ModelList, _> = serde_json::from_str("<html>404</html>");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn blank_env_model_is_treated_as_unset() {
+        // Missing, empty, and whitespace-only env models all normalize to None,
+        // so none of them can leak into the advertised id set.
+        assert_eq!(OpenAICompatProvider::parse_env_model(None), None);
+        assert_eq!(
+            OpenAICompatProvider::parse_env_model(Some(String::new())),
+            None
+        );
+        assert_eq!(
+            OpenAICompatProvider::parse_env_model(Some("   \t".into())),
+            None
+        );
+        // A real value survives, trimmed.
+        assert_eq!(
+            OpenAICompatProvider::parse_env_model(Some("  gpt-5.4 ".into())),
+            Some("gpt-5.4".to_string())
+        );
+    }
+
+    #[test]
+    fn no_env_model_and_failed_discovery_yields_no_entries() {
+        use super::SysError;
+
+        // The exact `llm_describe` state when env `model` is unset/blank AND
+        // `/v1/models` discovery fails: there is no configured default to fall
+        // back to, so the resolved id list MUST be empty — NOT a bogus `unknown`
+        // entry the registry could bind and then send upstream verbatim.
+        let failed: Result<Vec<String>, SysError> =
+            Err(SysError::ApiError("discovery failed".into()));
+        let model_ids = OpenAICompatProvider::resolve_model_ids(failed, None);
+        assert!(
+            model_ids.is_empty(),
+            "no env model + failed discovery must advertise nothing, got: {model_ids:?}"
+        );
+
+        // And the providers built from it carry no entries at all.
+        let providers = OpenAICompatProvider::describe_providers(&model_ids, "", 128_000, 8_192);
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn configured_default_survives_failed_discovery() {
+        use super::SysError;
+
+        // With a configured default, a discovery failure still falls back to the
+        // single pinned id so existing installs never regress.
+        let failed: Result<Vec<String>, SysError> = Err(SysError::ApiError("boom".into()));
+        let model_ids = OpenAICompatProvider::resolve_model_ids(failed, Some("gpt-5.4"));
+        assert_eq!(model_ids, vec!["gpt-5.4"]);
+    }
+
+    #[test]
+    fn successful_discovery_ignores_default_fallback() {
+        use super::SysError;
+
+        // On success the discovered ids are used verbatim regardless of default.
+        let ok: Result<Vec<String>, SysError> = Ok(vec!["a".into(), "b".into()]);
+        assert_eq!(
+            OpenAICompatProvider::resolve_model_ids(ok, None),
+            vec!["a", "b"]
+        );
     }
 
     #[test]
