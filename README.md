@@ -11,17 +11,17 @@ translates between an OS and hardware.
 
 Configure `base_url` to point at any compatible provider:
 
-| Provider | `base_url` |
-|---|---|
-| OpenAI | `https://api.openai.com` |
-| Groq | `https://api.groq.com/openai` |
-| Together | `https://api.together.ai` |
-| Mistral | `https://api.mistral.ai` |
-| DeepSeek | `https://api.deepseek.com` |
-| Fireworks | `https://api.fireworks.ai/inference` |
-| LM Studio | `http://localhost:1234` |
-| vLLM | `http://localhost:8000` |
-| llama.cpp | `http://localhost:8080` |
+| Provider | `base_url` | Notes |
+|---|---|---|
+| OpenAI | `https://api.openai.com` | |
+| Groq | `https://api.groq.com/openai` | |
+| Together | `https://api.together.ai` | |
+| Mistral | `https://api.mistral.ai` | |
+| DeepSeek | `https://api.deepseek.com` | |
+| Fireworks | `https://api.fireworks.ai/inference` | |
+| LM Studio | `http://localhost:1234` | Requires operator local-egress exemption -- see below |
+| vLLM | `http://localhost:8000` | Requires operator local-egress exemption -- see below |
+| llama.cpp | `http://localhost:8080` | Requires operator local-egress exemption -- see below |
 
 Set `base_url` to the provider **origin only** -- the capsule appends `/v1/chat/completions` for
 generation and `/v1/models` for discovery. Do not include a `/v1` suffix.
@@ -100,6 +100,42 @@ instance), leave `api_key` blank. A blank, whitespace-only, or newline-only key 
 absent: no `Authorization` header is sent. This avoids sending `Authorization: Bearer ` (with a
 blank value) which many permissive servers reject.
 
+### Local endpoints and the SSRF airlock
+
+The `astrid:http` host capability includes an SSRF airlock that blocks outbound requests to any
+address that resolves to a loopback, private, or link-local range -- `127.0.0.1`, `::1`,
+`192.168.x.x`, `10.x.x.x`, `169.254.x.x`, and similar. The airlock is on by default and protects
+against server-side request forgery.
+
+This matters for local LLM servers. If `base_url` points at a local address (for example LM
+Studio on `http://localhost:1234`, Ollama on `http://localhost:11434`, llama.cpp on
+`http://localhost:8080`, or a LAN box on `http://192.168.1.50:11434`), the capsule's runtime HTTP
+calls are blocked by the airlock. Both the `/v1/models` describe request (so the model list comes
+back empty) and the `/v1/chat/completions` generation request (so prompts fail silently or with a
+connection error) are affected. Remote or cloud endpoints (`https://api.openai.com`, Groq, etc.)
+are unaffected.
+
+**A subtlety worth knowing:** onboarding can look like it succeeded even when a local endpoint will
+fail at runtime. The installer's live model picker fetches `/v1/models` natively -- it runs outside
+the sandboxed capsule and does not go through the airlock. So the model select menu populates
+correctly during `astrid init`, but every prompt fails once the capsule is live. The fix is an
+operator-level exemption (see below), not a retry.
+
+**Granting a local-egress exemption (operator only)**
+
+Exemptions are set in the operator's `astrid.toml`, under `[security.capsule_local_egress]`. A
+capsule's own `Capsule.toml` cannot set this, and a project/workspace config layer cannot widen
+it. The default is no exemptions.
+
+```toml
+[security.capsule_local_egress]
+# host:port (or host:*) endpoints this capsule may reach even though they resolve to a local address
+"astrid-capsule-openai-compat" = ["127.0.0.1:1234", "192.168.1.50:11434"]
+```
+
+The exemption only lifts the airlock for those specific `host:port` pairs. It does not change the
+capsule's `net` allowlist, which is already `*`.
+
 ## Selecting a model at runtime
 
 Model selection is per-principal and stored in the registry capsule's KV store. You can change the
@@ -172,7 +208,10 @@ up?"). For each chosen provider it then runs the onboarding sequence in order:
 3. Pick a model from the live numbered menu (populated from `{base_url}/v1/models`)
 
 This sequence applies to both this capsule and the first-party `openai` capsule. If you are
-running a local server, set `base_url` to your local address and leave `api_key` blank.
+running a local server, set `base_url` to your local address and leave `api_key` blank. Note that
+the SSRF airlock blocks local addresses at runtime by default; you will also need an operator
+local-egress exemption before prompts work (see the "Local endpoints and the SSRF airlock" section
+above).
 
 ## IPC protocol
 
