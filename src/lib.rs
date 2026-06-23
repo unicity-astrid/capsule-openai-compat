@@ -139,14 +139,18 @@ impl OpenAICompatProvider {
     }
 
     /// Pure extraction + emptiness gate, split out so it is unit-testable
-    /// without HTTP. Drops empty ids; errors if nothing usable remains so the
-    /// caller falls back to the env default.
+    /// without HTTP. Drops blank ids (empty or whitespace-only, which cannot be
+    /// selected) and deduplicates colliding ids stably (preserving server
+    /// order), guarding against hostile upstreams that repeat an id; errors if
+    /// nothing usable remains so the caller falls back to the env default.
     fn extract_model_ids(list: ModelList) -> Result<Vec<String>, SysError> {
+        let mut seen = std::collections::HashSet::new();
         let ids: Vec<String> = list
             .data
             .into_iter()
             .map(|m| m.id)
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.trim().is_empty())
+            .filter(|id| seen.insert(id.clone()))
             .collect();
         if ids.is_empty() {
             return Err(SysError::ApiError("/v1/models returned no models".into()));
@@ -614,6 +618,33 @@ mod tests {
         let blank: ModelList =
             serde_json::from_str(r#"{ "data": [ { "id": "" } ] }"#).expect("parse");
         assert!(OpenAICompatProvider::extract_model_ids(blank).is_err());
+
+        // A sole entry with a whitespace-only `id` is likewise dropped: it
+        // cannot be selected, so it funnels to the same fallback Err arm.
+        let whitespace: ModelList =
+            serde_json::from_str(r#"{ "data": [ { "id": "   " } ] }"#).expect("parse");
+        assert!(OpenAICompatProvider::extract_model_ids(whitespace).is_err());
+    }
+
+    #[test]
+    fn duplicate_ids_are_deduplicated_preserving_order() {
+        // A buggy/hostile upstream that repeats an id must not yield two
+        // provider entries with the same id. Dedup is stable on server order.
+        let dup: ModelList =
+            serde_json::from_str(r#"{ "data": [ { "id": "gpt-5.4" }, { "id": "gpt-5.4" } ] }"#)
+                .expect("parse");
+        let ids = OpenAICompatProvider::extract_model_ids(dup).expect("one survivor");
+        assert_eq!(ids, vec!["gpt-5.4"]);
+        assert_eq!(ids.len(), 1);
+
+        // Non-adjacent collisions collapse too, and the first occurrence wins
+        // (server order preserved for the survivors).
+        let scattered: ModelList = serde_json::from_str(
+            r#"{ "data": [ { "id": "a" }, { "id": "b" }, { "id": "a" }, { "id": "c" } ] }"#,
+        )
+        .expect("parse");
+        let ids = OpenAICompatProvider::extract_model_ids(scattered).expect("survivors");
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 
     #[test]
