@@ -27,6 +27,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const STREAM_TOPIC: &str = "llm.v1.stream.openai-compat";
+/// IPC topic providers advertise (and the registry routes generation requests
+/// to) for this capsule. Single source of truth, reused by `describe_providers`
+/// and the test suite.
+const REQUEST_TOPIC: &str = "llm.v1.request.generate.openai-compat";
 /// Maximum SSE line buffer size (1 MB). If the server sends data without
 /// a newline that exceeds this, the stream is aborted.
 const MAX_LINE_BUFFER_SIZE: usize = 1024 * 1024;
@@ -149,6 +153,23 @@ impl OpenAICompatProvider {
         }
     }
 
+    /// Build the `Authorization` header value from a raw configured key.
+    ///
+    /// Returns `Some("Bearer <trimmed>")` only when the key has non-whitespace
+    /// content; a missing, empty, or whitespace/newline-only key (common from a
+    /// copy-paste) is treated as **keyless** (`None`) so we never emit
+    /// `Authorization: Bearer <whitespace>`, which permissive/keyless
+    /// OpenAI-compatible servers reject. The header carries the trimmed value,
+    /// stripping stray surrounding whitespace from the configured secret.
+    fn bearer_header(raw_key: &str) -> Option<String> {
+        let trimmed = raw_key.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("Bearer {trimmed}"))
+        }
+    }
+
     /// Query `GET {base_url}/v1/models` and return the discovered model ids.
     ///
     /// Returns `Ok(Vec)` with **at least one** id on success. Any failure
@@ -161,9 +182,12 @@ impl OpenAICompatProvider {
         let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
 
         let mut req = http::Request::get(&url);
-        let api_key = env::var("api_key").unwrap_or_default();
-        if !api_key.is_empty() {
-            req = req.header("authorization", format!("Bearer {api_key}"));
+        // Only send `Authorization` when the key has non-whitespace content, and
+        // send the trimmed value: a whitespace/newline-only key (common from a
+        // copy-paste) must be treated as keyless, not sent as `Bearer <ws>`,
+        // which breaks discovery against keyless/permissive servers.
+        if let Some(value) = Self::bearer_header(&env::var("api_key").unwrap_or_default()) {
+            req = req.header("authorization", value);
         }
 
         let resp = http::send(&req)?;
@@ -232,7 +256,7 @@ impl OpenAICompatProvider {
                     "id": id,
                     "description": format!("OpenAI-compatible model: {id}"),
                     "capabilities": ["text", "vision", "tools"],
-                    "request_topic": "llm.v1.request.generate.openai-compat",
+                    "request_topic": REQUEST_TOPIC,
                     "stream_topic": STREAM_TOPIC,
                     "context_window": context_window,
                     "max_output_tokens": max_output,
@@ -566,9 +590,7 @@ impl OpenAICompatProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelList, OpenAICompatProvider};
-
-    const REQUEST_TOPIC: &str = "llm.v1.request.generate.openai-compat";
+    use super::{ModelList, OpenAICompatProvider, REQUEST_TOPIC};
 
     /// Helper: collect the `id` field of every provider entry, in order.
     fn ids(entries: &[serde_json::Value]) -> Vec<String> {
@@ -775,5 +797,31 @@ mod tests {
         assert_eq!(entry["request_topic"].as_str().unwrap(), REQUEST_TOPIC);
         // Shape-stable, positionally-default, no "default" key.
         assert!(entry.get("default").is_none());
+    }
+
+    #[test]
+    fn whitespace_only_api_key_is_treated_as_keyless() {
+        // A copy-pasted key that is empty or only whitespace/newlines must NOT
+        // produce an `Authorization` header: sending `Bearer <whitespace>`
+        // breaks discovery against keyless/permissive servers. Treat it as
+        // keyless (no header) instead.
+        assert_eq!(OpenAICompatProvider::bearer_header(""), None);
+        assert_eq!(OpenAICompatProvider::bearer_header("   "), None);
+        assert_eq!(OpenAICompatProvider::bearer_header("\n"), None);
+        assert_eq!(OpenAICompatProvider::bearer_header(" \t\r\n "), None);
+    }
+
+    #[test]
+    fn real_api_key_is_trimmed_and_sent() {
+        // A genuine key still produces a header, with stray surrounding
+        // whitespace (copy-paste newline) stripped from the sent value.
+        assert_eq!(
+            OpenAICompatProvider::bearer_header("sk-abc123"),
+            Some("Bearer sk-abc123".to_string())
+        );
+        assert_eq!(
+            OpenAICompatProvider::bearer_header("  sk-abc123\n"),
+            Some("Bearer sk-abc123".to_string())
+        );
     }
 }
