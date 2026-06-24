@@ -26,11 +26,11 @@ use schemas::{ChatCompletionChunk, ModelList};
 use serde_json::Value;
 use uuid::Uuid;
 
-const STREAM_TOPIC: &str = "llm.v1.stream.astrid-capsule-openai-compat";
+const STREAM_TOPIC: &str = concat!("llm.v1.stream.", env!("CARGO_PKG_NAME"));
 /// IPC topic providers advertise (and the registry routes generation requests
 /// to) for this capsule. The suffix must match the package id the kernel uses
 /// for IPC source stamps, or registry provider authentication will reject it.
-const REQUEST_TOPIC: &str = "llm.v1.request.generate.astrid-capsule-openai-compat";
+const REQUEST_TOPIC: &str = concat!("llm.v1.request.generate.", env!("CARGO_PKG_NAME"));
 /// Maximum SSE line buffer size (1 MB). If the server sends data without
 /// a newline that exceeds this, the stream is aborted.
 const MAX_LINE_BUFFER_SIZE: usize = 1024 * 1024;
@@ -642,8 +642,10 @@ mod tests {
             "llm.v1.request.generate.astrid-capsule-openai-compat"
         );
         assert_eq!(STREAM_TOPIC, "llm.v1.stream.astrid-capsule-openai-compat");
-        assert!(!REQUEST_TOPIC.ends_with(".openai-compat"));
-        assert!(!STREAM_TOPIC.ends_with(".openai-compat"));
+        const CAPSULE_PACKAGE_ID: &str = env!("CARGO_PKG_NAME");
+        let authenticated_suffix = format!(".{CAPSULE_PACKAGE_ID}");
+        assert!(REQUEST_TOPIC.ends_with(&authenticated_suffix));
+        assert!(STREAM_TOPIC.ends_with(&authenticated_suffix));
     }
 
     #[test]
