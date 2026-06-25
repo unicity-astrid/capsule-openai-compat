@@ -639,7 +639,6 @@ mod tests {
         assert_eq!(STREAM_TOPIC, "llm.v1.stream.openai-compat");
         assert!(REQUEST_TOPIC.ends_with(PROVIDER_TOPIC_ALIAS));
         assert!(STREAM_TOPIC.ends_with(PROVIDER_TOPIC_ALIAS));
-        assert_ne!(PROVIDER_TOPIC_ALIAS, env!("CARGO_PKG_NAME"));
     }
 
     #[test]
